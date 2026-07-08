@@ -17,6 +17,37 @@ function clampZoomLevel(value) {
   return Math.min(Math.max(value, MIN_ZOOM_LEVEL), MAX_ZOOM_LEVEL)
 }
 
+function parseStoredZoomLevel(value) {
+  if (value == null) return null
+  return clampZoomLevel(Number(value))
+}
+
+function serializeZoomLevel(value) {
+  return String(clampZoomLevel(value))
+}
+
+function createZoomStateCache(map = new WeakMap()) {
+  return {
+    get(window) {
+      if (!window) return null
+      return map.has(window) ? map.get(window) : null
+    },
+    set(window, value) {
+      if (!window) return null
+      const level = clampZoomLevel(value)
+      map.set(window, level)
+
+      return level
+    },
+    resolve(window, storedValue) {
+      const cached = this.get(window)
+      if (cached != null) return cached
+
+      return parseStoredZoomLevel(storedValue)
+    }
+  }
+}
+
 function zoomLevelToPercent(level) {
   return Math.round(Math.pow(ZOOM_FACTOR_BASE, clampZoomLevel(level)) * 100)
 }
@@ -29,6 +60,9 @@ function percentToZoomLevel(percent) {
 module.exports = {
   ZOOM_STORAGE_KEY,
   clampZoomLevel,
+  createZoomStateCache,
+  parseStoredZoomLevel,
   percentToZoomLevel,
+  serializeZoomLevel,
   zoomLevelToPercent
 }

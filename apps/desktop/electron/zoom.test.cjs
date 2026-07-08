@@ -7,7 +7,15 @@
 const test = require('node:test')
 const assert = require('node:assert/strict')
 
-const { ZOOM_STORAGE_KEY, clampZoomLevel, percentToZoomLevel, zoomLevelToPercent } = require('./zoom.cjs')
+const {
+  ZOOM_STORAGE_KEY,
+  clampZoomLevel,
+  createZoomStateCache,
+  parseStoredZoomLevel,
+  percentToZoomLevel,
+  serializeZoomLevel,
+  zoomLevelToPercent
+} = require('./zoom.cjs')
 
 test('storage key stays stable so persisted zoom survives upgrades', () => {
   assert.equal(ZOOM_STORAGE_KEY, 'hermes:desktop:zoomLevel')
@@ -33,6 +41,38 @@ test('percentToZoomLevel rejects garbage', () => {
   assert.equal(percentToZoomLevel(0), 0)
   assert.equal(percentToZoomLevel(-50), 0)
   assert.equal(percentToZoomLevel(undefined), 0)
+})
+
+test('stored zoom serializes and restores the 110 percent preset', () => {
+  const level = percentToZoomLevel(110)
+  const stored = serializeZoomLevel(level)
+
+  assert.equal(zoomLevelToPercent(parseStoredZoomLevel(stored)), 110)
+})
+
+test('missing stored zoom leaves the app at the default 100 percent', () => {
+  assert.equal(parseStoredZoomLevel(null), null)
+  assert.equal(zoomLevelToPercent(0), 100)
+})
+
+test('cached user zoom wins across reload before stale storage can reset it', () => {
+  const win = {}
+  const cache = createZoomStateCache(new Map())
+  const zoom110 = percentToZoomLevel(110)
+
+  cache.set(win, zoom110)
+
+  assert.equal(zoomLevelToPercent(cache.resolve(win, serializeZoomLevel(0))), 110)
+})
+
+test('intentional reset from 110 back to 100 updates the cached source of truth', () => {
+  const win = {}
+  const cache = createZoomStateCache(new Map())
+
+  cache.set(win, percentToZoomLevel(110))
+  cache.set(win, percentToZoomLevel(100))
+
+  assert.equal(zoomLevelToPercent(cache.resolve(win, serializeZoomLevel(percentToZoomLevel(110)))), 100)
 })
 
 test('preset percentages roundtrip within rounding', () => {

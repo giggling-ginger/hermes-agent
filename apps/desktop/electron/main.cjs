@@ -4167,32 +4167,60 @@ function installPreviewShortcut(window) {
 // survives reloads/restarts) rather than a main-process JSON file. The main
 // process owns setZoomLevel, so we mirror each change into localStorage and
 // read it back on did-finish-load to re-apply after reloads or crash recovery.
-const { ZOOM_STORAGE_KEY, clampZoomLevel, percentToZoomLevel, zoomLevelToPercent } = require('./zoom.cjs')
+const {
+  ZOOM_STORAGE_KEY,
+  createZoomStateCache,
+  percentToZoomLevel,
+  serializeZoomLevel,
+  zoomLevelToPercent
+} = require('./zoom.cjs')
+const zoomState = createZoomStateCache()
 
-function setAndPersistZoomLevel(window, zoomLevel) {
+function applyZoomLevel(window, zoomLevel) {
   if (!window || window.isDestroyed()) return
-  const next = clampZoomLevel(zoomLevel)
+  const next = zoomState.set(window, zoomLevel)
   window.webContents.setZoomLevel(next)
   // Keep any open settings UI in sync, including changes made via the
   // keyboard shortcuts or the View menu.
   window.webContents.send('hermes:zoom:changed', { level: next, percent: zoomLevelToPercent(next) })
+
+  return next
+}
+
+function readPersistedZoomLevel(window) {
+  if (!window || window.isDestroyed()) return Promise.resolve(null)
+
+  return window.webContents
+    .executeJavaScript(
+      `(() => { try { return localStorage.getItem(${JSON.stringify(ZOOM_STORAGE_KEY)}) } catch { return null } })()`
+    )
+    .then(stored => zoomState.resolve(window, stored))
+}
+
+function setAndPersistZoomLevel(window, zoomLevel) {
+  const next = applyZoomLevel(window, zoomLevel)
+  if (next == null) return
   window.webContents
     .executeJavaScript(
-      `try { localStorage.setItem(${JSON.stringify(ZOOM_STORAGE_KEY)}, ${JSON.stringify(String(next))}) } catch {}`
+      `try { localStorage.setItem(${JSON.stringify(ZOOM_STORAGE_KEY)}, ${JSON.stringify(serializeZoomLevel(next))}) } catch {}`
     )
     .catch(error => rememberLog(`[zoom] persist failed: ${error?.message || error}`))
 }
 
 function restorePersistedZoomLevel(window) {
   if (!window || window.isDestroyed()) return
-  window.webContents
-    .executeJavaScript(
-      `(() => { try { return localStorage.getItem(${JSON.stringify(ZOOM_STORAGE_KEY)}) } catch { return null } })()`
-    )
-    .then(stored => {
-      if (stored == null || !window || window.isDestroyed()) return
-      const level = clampZoomLevel(Number(stored))
-      window.webContents.setZoomLevel(level)
+
+  const cached = zoomState.get(window)
+  if (cached != null) {
+    applyZoomLevel(window, cached)
+
+    return
+  }
+
+  readPersistedZoomLevel(window)
+    .then(level => {
+      if (level == null || !window || window.isDestroyed()) return
+      applyZoomLevel(window, level)
     })
     .catch(error => rememberLog(`[zoom] restore failed: ${error?.message || error}`))
 }
@@ -5734,6 +5762,7 @@ function wireCommonWindowHandlers(win) {
   installDevToolsShortcut(win)
   installZoomShortcuts(win)
   installContextMenu(win)
+  win.webContents.on('did-finish-load', () => restorePersistedZoomLevel(win))
   win.webContents.setWindowOpenHandler(details => {
     openExternalUrl(details.url)
 
@@ -6089,7 +6118,6 @@ function createWindow() {
   }
 
   mainWindow.webContents.once('did-finish-load', () => {
-    restorePersistedZoomLevel(mainWindow)
     broadcastBootProgress()
     sendWindowStateChanged()
     startHermes().catch(error => rememberLog(error.stack || error.message))
@@ -6159,9 +6187,15 @@ ipcMain.handle('hermes:window:openNewSession', async () => {
 // --- Text size (zoom) -------------------------------------------------------
 // The settings UI drives the same clamped zoom scale as the Ctrl/Cmd
 // shortcuts and the View menu. Reads and writes target the asking window.
-ipcMain.handle('hermes:zoom:get', event => {
+ipcMain.handle('hermes:zoom:get', async event => {
   const window = BrowserWindow.fromWebContents(event.sender)
-  const level = window && !window.isDestroyed() ? window.webContents.getZoomLevel() : 0
+  let level = zoomState.get(window)
+  if (level == null) {
+    level = await readPersistedZoomLevel(window)
+  }
+  if (level == null) {
+    level = window && !window.isDestroyed() ? window.webContents.getZoomLevel() : 0
+  }
 
   return { level, percent: zoomLevelToPercent(level) }
 })
