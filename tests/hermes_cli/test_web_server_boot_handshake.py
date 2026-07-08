@@ -53,6 +53,35 @@ def _make_slow_drain(seconds: float):
 
 
 # ---------------------------------------------------------------------------
+# Ready-line compatibility
+# ---------------------------------------------------------------------------
+
+def test_dashboard_ready_lines_use_legacy_token_for_dashboard(monkeypatch):
+    monkeypatch.delenv("HERMES_DESKTOP", raising=False)
+
+    assert web_server_mod._dashboard_ready_lines(54321, headless=False) == [
+        "HERMES_DASHBOARD_READY port=54321"
+    ]
+
+
+def test_dashboard_ready_lines_use_backend_token_for_plain_headless(monkeypatch):
+    monkeypatch.delenv("HERMES_DESKTOP", raising=False)
+
+    assert web_server_mod._dashboard_ready_lines(43210, headless=True) == [
+        "HERMES_BACKEND_READY port=43210"
+    ]
+
+
+def test_dashboard_ready_lines_keep_legacy_token_for_desktop_headless(monkeypatch):
+    monkeypatch.setenv("HERMES_DESKTOP", "1")
+
+    assert web_server_mod._dashboard_ready_lines(43210, headless=True) == [
+        "HERMES_BACKEND_READY port=43210",
+        "HERMES_DASHBOARD_READY port=43210",
+    ]
+
+
+# ---------------------------------------------------------------------------
 # Test 1 — _lifespan fire-and-forget does not block the event loop
 # ---------------------------------------------------------------------------
 

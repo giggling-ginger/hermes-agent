@@ -16606,6 +16606,21 @@ def _write_dashboard_ready_file(actual_port: int) -> None:
         _log.warning("Failed to write dashboard ready file %r: %s", target, exc)
 
 
+def _dashboard_ready_lines(actual_port: int, *, headless: bool) -> list[str]:
+    """Return stdout port-discovery sentinels for dashboard/desktop spawns."""
+    if not headless:
+        return [f"HERMES_DASHBOARD_READY port={actual_port}"]
+
+    lines = [f"HERMES_BACKEND_READY port={actual_port}"]
+    if os.environ.get("HERMES_DESKTOP") == "1":
+        # Compatibility for packaged desktop shells whose Electron parser only
+        # knows the legacy dashboard token. They may launch an updated Python
+        # backend via `hermes serve`, so keep the old sentinel as a side-channel
+        # when and only when the backend is desktop-spawned.
+        lines.append(f"HERMES_DASHBOARD_READY port={actual_port}")
+    return lines
+
+
 def _maybe_open_browser(
     host: str, actual_port: int, open_browser: bool, initial_profile: str
 ) -> None:
@@ -16825,9 +16840,10 @@ def start_server(
             _write_dashboard_ready_file(actual_port)
             # Port-discovery sentinel parsed by the desktop spawn. `serve` is a
             # plain backend, not a dashboard, so it announces a neutral token;
-            # `dashboard` keeps the legacy one. The desktop matches either.
-            ready_token = "HERMES_BACKEND_READY" if headless else "HERMES_DASHBOARD_READY"
-            print(f"{ready_token} port={actual_port}", flush=True)
+            # desktop-spawned `serve` also emits the legacy token for older
+            # packaged shells whose parser predates HERMES_BACKEND_READY.
+            for ready_line in _dashboard_ready_lines(actual_port, headless=headless):
+                print(ready_line, flush=True)
             if headless:
                 # No SPA, and the JSON-RPC/WS endpoints are auth-gated — don't
                 # advertise a paste-and-connect URL, just announce the bind.
