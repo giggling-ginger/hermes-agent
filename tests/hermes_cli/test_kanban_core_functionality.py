@@ -4457,6 +4457,90 @@ def test_detect_crashed_workers_protocol_violation_auto_blocks(kanban_home):
         conn.close()
 
 
+def test_protocol_violation_restores_task_with_prior_completed_run(kanban_home):
+    """A duplicate clean-exit worker must not block a task already completed
+    by an earlier run.
+    """
+    import hermes_cli.kanban_db as _kb
+    conn = kb.connect()
+    try:
+        tid = kb.create_task(conn, title="already shipped", assignee="worker")
+        host_prefix = _kb._claimer_id().split(":", 1)[0]
+        lock = f"{host_prefix}:mock"
+
+        kb.claim_task(conn, tid, claimer=lock)
+        assert kb.complete_task(
+            conn,
+            tid,
+            result="shipped",
+            summary="implemented and verified",
+        )
+
+        # Preserve a separate historical crash row to prove the recovery only
+        # annotates the current protocol-violation run.
+        old_started = int(time.time()) - 120
+        old_ended = old_started + 5
+        old_crash_id = conn.execute(
+            "INSERT INTO task_runs (task_id, status, outcome, started_at, ended_at, error) "
+            "VALUES (?, 'crashed', 'crashed', ?, ?, 'old crash')",
+            (tid, old_started, old_ended),
+        ).lastrowid
+
+        # Simulate the stale duplicate/retry shape from #60802: the task has
+        # a completed run in history, but a later dispatcher attempt put it
+        # back into running state.
+        with kb.write_txn(conn):
+            conn.execute(
+                "UPDATE tasks SET status = 'ready', completed_at = NULL WHERE id = ?",
+                (tid,),
+            )
+        kb.claim_task(conn, tid, claimer=lock)
+        fake_pid = 999997
+        kb._set_worker_pid(conn, tid, fake_pid)
+
+        _kb._record_worker_exit(fake_pid, 0)
+        original_alive = _kb._pid_alive
+        _kb._pid_alive = lambda p: False
+        try:
+            result_crashed = kb.detect_crashed_workers(conn)
+        finally:
+            _kb._pid_alive = original_alive
+
+        assert tid in result_crashed
+        task = kb.get_task(conn, tid)
+        assert task.status == "done"
+        assert task.completed_at is not None
+        assert task.consecutive_failures == 0
+        assert task.last_failure_error is None
+        assert task.current_run_id is None
+
+        old_crash = conn.execute(
+            "SELECT status, outcome, error FROM task_runs WHERE id = ?",
+            (old_crash_id,),
+        ).fetchone()
+        assert dict(old_crash) == {
+            "status": "crashed",
+            "outcome": "crashed",
+            "error": "old crash",
+        }
+
+        runs = kb.list_runs(conn, tid)
+        assert [(r.status, r.outcome) for r in runs].count(("done", "completed")) == 1
+        assert any(
+            r.status == "blocked"
+            and r.outcome == "crashed"
+            and r.error == "Worker restored — task already completed in prior run"
+            for r in runs
+        )
+
+        events = kb.list_events(conn, tid)
+        kinds = [e.kind for e in events]
+        assert "protocol_violation" in kinds
+        assert "gave_up" not in kinds
+    finally:
+        conn.close()
+
+
 def test_detect_crashed_workers_nonzero_exit_uses_default_limit(kanban_home):
     """A worker that exited non-zero (real error / crash) uses the
     normal counter path — one failure doesn't trip the breaker.

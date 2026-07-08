@@ -6378,8 +6378,8 @@ def detect_crashed_workers(conn: sqlite3.Connection) -> list[str]:
     # write_txn so can't nest). ``protocol_violation`` flags the
     # clean-exit-but-still-running case so we can trip the breaker
     # immediately instead of incrementing by 1.
-    crash_details: list[tuple[str, int, str, bool, str]] = []
-    # (task_id, pid, claimer, protocol_violation, error_text)
+    crash_details: list[tuple[str, int, str, bool, str, Optional[int]]] = []
+    # (task_id, pid, claimer, protocol_violation, error_text, run_id)
     with write_txn(conn):
         rows = conn.execute(
             "SELECT id, worker_pid, claim_lock, started_at FROM tasks "
@@ -6493,7 +6493,7 @@ def detect_crashed_workers(conn: sqlite3.Connection) -> list[str]:
                     crashed.append(row["id"])
                     crash_details.append(
                         (row["id"], pid, row["claim_lock"],
-                         protocol_violation, error_text)
+                         protocol_violation, error_text, run_id)
                     )
     # Outside the main txn: increment the unified failure counter for
     # each crashed task. If the breaker trips, the task transitions
@@ -6509,15 +6509,40 @@ def detect_crashed_workers(conn: sqlite3.Connection) -> list[str]:
     if crash_details:
         # Fingerprint errors to detect systemic failures.
         _fp_counts: dict[str, int] = {}
-        for _, _, _, _, err_text in crash_details:
+        for _, _, _, _, err_text, _ in crash_details:
             fp = _error_fingerprint(err_text)
             _fp_counts[fp] = _fp_counts.get(fp, 0) + 1
-        for tid, pid, claimer, protocol_violation, error_text in crash_details:
+        for tid, pid, claimer, protocol_violation, error_text, run_id in crash_details:
             fp = _error_fingerprint(error_text)
             is_systemic = (
                 not protocol_violation
                 and _fp_counts.get(fp, 0) >= 3
             )
+            if protocol_violation:
+                prior_done = conn.execute(
+                    "SELECT ended_at FROM task_runs "
+                    "WHERE task_id = ? AND status = 'done' "
+                    "ORDER BY id DESC LIMIT 1",
+                    (tid,),
+                ).fetchone()
+                if prior_done:
+                    completed_at = prior_done["ended_at"] or int(time.time())
+                    with write_txn(conn):
+                        conn.execute(
+                            "UPDATE tasks SET status = 'done', "
+                            "completed_at = COALESCE(completed_at, ?), "
+                            "consecutive_failures = 0, "
+                            "last_failure_error = NULL, "
+                            "block_kind = NULL, "
+                            "block_recurrences = 0 WHERE id = ?",
+                            (completed_at, tid),
+                        )
+                        conn.execute(
+                            "UPDATE task_runs SET status = 'blocked', "
+                            "error = 'Worker restored — task already completed in prior run' "
+                            "WHERE id = ?", (run_id,),
+                        )
+                    continue
             tripped = _record_task_failure(
                 conn, tid,
                 error=error_text,
