@@ -11942,6 +11942,17 @@ def cmd_dashboard(args):
     # build gate, and start_server.
     _headless_backend = getattr(args, "headless_backend", False)
 
+    # Desktop-spawned backends must die with Electron. before-quit waits and
+    # SIGKILLs when it can, but force-quit/crash never runs that path — without
+    # a parent-death watchdog, `serve` processes reparent to launchd and pile
+    # up (~330MB each; #61349). No-op when HERMES_DESKTOP is unset.
+    try:
+        from hermes_cli.parent_death_watchdog import start_desktop_parent_death_watchdog
+
+        start_desktop_parent_death_watchdog()
+    except Exception:
+        pass
+
     # ── Unified profile launch routing ────────────────────────────────
     # The dashboard is a MACHINE management surface: it can read/write any
     # profile via the per-request ?profile= scoping. Running one dashboard

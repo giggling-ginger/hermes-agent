@@ -2348,7 +2348,8 @@ function isShimLocked(shimPath) {
 // the whole tree synchronously. Windows-only: this is called solely from the
 // Windows shim-unlock path, and the backend is NOT spawned detached (so it's
 // not a process-group leader — a POSIX negative-pgid kill would be meaningless
-// here anyway). POSIX teardown stays with the existing before-quit SIGTERM.
+// here anyway). POSIX quit path: SIGTERM → wait → SIGKILL (see stopBackendChild
+// / before-quit / waitForBackendExit; #61349).
 function forceKillProcessTree(pid) {
   if (!IS_WINDOWS) {
     return
@@ -2378,10 +2379,9 @@ function forceKillProcessTree(pid) {
 // so by the time we spawn the updater the lock is genuinely gone.
 //
 // Windows-only: the venv-shim mandatory lock is a Windows phenomenon. On
-// macOS/Linux there's no REPLACE-on-running-exe block, the existing before-quit
-// SIGTERM + app.quit() teardown already works (the macOS path is flawless), and
-// aggressively SIGKILL-ing the backend here would be an untested behavior change
-// for no benefit. So we no-op off Windows and leave that path exactly as it was.
+// macOS/Linux there's no REPLACE-on-running-exe block, so this update hand-off
+// path no-ops; normal quit uses the shared SIGTERM→wait→SIGKILL teardown
+// (#61349) rather than tree-kill here.
 async function releaseBackendLockForUpdate(updateRoot) {
   return releaseBackendLock(updateRoot, 'updates')
 }
@@ -2395,7 +2395,7 @@ async function releaseBackendLockForUpdate(updateRoot) {
 // the desktop owns, then poll the shim until it's genuinely writable.
 //
 // `tag` only flavors the log lines. No-op off Windows (POSIX has no mandatory
-// locks — the before-quit SIGTERM + the cleanup script's own PID-wait suffice).
+// locks — before-quit SIGTERM→SIGKILL + the cleanup script's PID-wait suffice).
 async function releaseBackendLock(updateRoot, tag) {
   if (!IS_WINDOWS) {
     return { unlocked: true }
@@ -5895,6 +5895,11 @@ function resetBootProgressForReconnect() {
   )
 }
 
+// How long POSIX backends get after SIGTERM before we escalate to SIGKILL.
+// Mirrors waitForBackendExit()'s default. Timers only help while Electron is
+// still alive (reconnect, idle pool reap); before-quit must await exit.
+const BACKEND_SIGKILL_ESCALATION_MS = 5000
+
 function stopBackendChild(child) {
   if (!child || child.killed) {
     return
@@ -5904,7 +5909,30 @@ function stopBackendChild(child) {
     if (IS_WINDOWS && Number.isInteger(child.pid)) {
       forceKillProcessTree(child.pid)
     } else {
+      // macOS/Linux: SIGTERM alone is not enough. uvicorn/asyncio can stall
+      // under GIL pressure and ignore graceful exit until the loop unblocks,
+      // leaving multi-hundred-MB `serve` orphans reparented to launchd (#61349).
+      // Escalate to SIGKILL after a bounded grace window while we still live.
       child.kill('SIGTERM')
+      const timer = setTimeout(() => {
+        try {
+          if (child.exitCode === null && child.signalCode === null) {
+            child.kill('SIGKILL')
+          }
+        } catch {
+          // Already gone.
+        }
+      }, BACKEND_SIGKILL_ESCALATION_MS)
+
+      if (typeof timer.unref === 'function') {
+        // Don't keep the event loop alive solely for escalation during normal
+        // operation; before-quit awaits waitForBackendExit which SIGKILLs too.
+        timer.unref()
+      }
+
+      child.once('exit', () => {
+        clearTimeout(timer)
+      })
     }
   } catch {
     // Already gone.
@@ -8564,7 +8592,12 @@ function configureSpellChecker() {
   }
 }
 
-app.on('before-quit', () => {
+// Set once we begin async backend teardown on quit. before-quit re-enters after
+// app.quit() from the cleanup promise; the second pass must not preventDefault
+// again or quit never completes.
+let backendQuitTeardownStarted = false
+
+app.on('before-quit', event => {
   // The always-on-top overlay isn't a "real" app window; close it so a stray
   // pet can't keep the process alive or float over a quit app.
   closePetOverlay()
@@ -8592,8 +8625,51 @@ app.on('before-quit', () => {
     disposeTerminalSession(id)
   }
 
-  stopBackendChild(hermesProcess)
-  stopAllPoolBackends()
+  // Re-entry after our own app.quit() once backends are dead — allow quit.
+  if (backendQuitTeardownStarted) {
+    return
+  }
+
+  const primaryAlive = Boolean(hermesProcess && !hermesProcess.killed)
+  const poolProfiles = [...backendPool.keys()]
+
+  // No live backends to wait on. Best-effort signal any stale ref and proceed.
+  if (!primaryAlive && poolProfiles.length === 0) {
+    stopBackendChild(hermesProcess)
+    hermesProcess = null
+
+    return
+  }
+
+  // #61349: fire-and-forget SIGTERM is not enough on macOS/Linux. Electron can
+  // exit before the Python `serve` process finishes (or while its event loop is
+  // stalled), leaving orphans reparented to launchd (~330MB each). Hold quit,
+  // reuse the same SIGTERM → wait → SIGKILL path as profile/connection switches.
+  event.preventDefault()
+  backendQuitTeardownStarted = true
+
+  void (async () => {
+    try {
+      const jobs = []
+
+      if (primaryAlive) {
+        jobs.push(teardownPrimaryBackendAndWait())
+      } else {
+        stopBackendChild(hermesProcess)
+        hermesProcess = null
+      }
+
+      for (const profile of poolProfiles) {
+        jobs.push(teardownPoolBackendAndWait(profile))
+      }
+
+      await Promise.all(jobs)
+    } catch (error) {
+      rememberLog(`Backend quit teardown failed: ${error?.message || error}`)
+    } finally {
+      app.quit()
+    }
+  })()
 })
 
 app.on('window-all-closed', () => {
