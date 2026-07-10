@@ -769,6 +769,17 @@ def execute_tool_calls_concurrent(agent, assistant_message, messages: list, effe
                                 pass
                         break
 
+                    # Promote kanban terminal-transition stop into an agent
+                    # interrupt so concurrent siblings are cancelled (#61923).
+                    if not agent._interrupt_requested:
+                        try:
+                            from tools.kanban_tools import worker_stop_requested
+
+                            if worker_stop_requested():
+                                agent._interrupt_requested = True
+                        except Exception:
+                            pass
+
                     # Check for interrupt — the per-thread interrupt signal
                     # already causes individual tools (terminal, execute_code)
                     # to abort, but tools without interrupt checks (web_search,
@@ -1645,6 +1656,19 @@ def execute_tool_calls_sequential(agent, assistant_message, messages: list, effe
                 _fr_str = function_result if isinstance(function_result, str) else str(function_result)
                 response_preview = _fr_str[:agent.log_prefix_chars] + "..." if len(_fr_str) > agent.log_prefix_chars else _fr_str
                 print(f"  ✅ Tool {i} completed in {tool_duration:.2f}s - {response_preview}")
+
+        # Kanban worker terminal tools (#61923) set a process flag so no
+        # further tools run after complete/block — promote that to the
+        # agent interrupt so remaining calls in this sequential batch
+        # are skipped the same way as a user interrupt.
+        if not agent._interrupt_requested:
+            try:
+                from tools.kanban_tools import worker_stop_requested
+
+                if worker_stop_requested():
+                    agent._interrupt_requested = True
+            except Exception:
+                pass
 
         if agent._interrupt_requested and i < len(assistant_message.tool_calls):
             remaining = len(assistant_message.tool_calls) - i
