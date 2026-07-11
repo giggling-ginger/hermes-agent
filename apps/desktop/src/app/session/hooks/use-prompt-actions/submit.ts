@@ -119,16 +119,17 @@ export function useSubmitPrompt(deps: SubmitPromptDeps) {
       // this, a fast session switch during session.resume / file.attach can
       // redirect the user's text into a different chat (#54527).
       const startingActiveSessionId = activeSessionIdRef.current
-      const startingStoredSessionId = selectedStoredSessionIdRef.current
+      let targetStoredSessionId = selectedStoredSessionIdRef.current
       const startingRouteToken = getRouteToken()
+      let routePinned = true
 
       const sessionContextDrifted = (): boolean =>
-        selectedStoredSessionIdRef.current !== startingStoredSessionId ||
-        getRouteToken() !== startingRouteToken
+        selectedStoredSessionIdRef.current !== targetStoredSessionId ||
+        (routePinned && getRouteToken() !== startingRouteToken)
 
       // One submit in flight per session — drop any concurrent re-fire so a
       // stalled turn can't stack the same prompt into multiple real turns.
-      const submitLockKey = startingStoredSessionId || startingActiveSessionId || '__pending_new__'
+      const submitLockKey = targetStoredSessionId || startingActiveSessionId || '__pending_new__'
 
       if (_submitInFlight.has(submitLockKey)) {
         return false
@@ -179,7 +180,7 @@ export function useSubmitPrompt(deps: SubmitPromptDeps) {
             // (what made drained-after-interrupt sends go silent).
             interrupted: false
           }),
-          startingStoredSessionId
+          targetStoredSessionId
         )
 
       // After sync rewrites refs, refresh the optimistic message in place so the
@@ -191,7 +192,7 @@ export function useSubmitPrompt(deps: SubmitPromptDeps) {
             ...state,
             messages: state.messages.map(message => (message.id === optimisticId ? buildUserMessage() : message))
           }),
-          startingStoredSessionId
+          targetStoredSessionId
         )
 
       const dropOptimistic = (sid: null | string) => {
@@ -210,7 +211,7 @@ export function useSubmitPrompt(deps: SubmitPromptDeps) {
             awaitingResponse: false,
             pendingBranchGroup: null
           }),
-          startingStoredSessionId
+          targetStoredSessionId
         )
       }
 
@@ -234,7 +235,7 @@ export function useSubmitPrompt(deps: SubmitPromptDeps) {
         setMessages(current => [...current, buildUserMessage()])
       }
 
-      if (!sessionId && startingStoredSessionId) {
+      if (!sessionId && targetStoredSessionId) {
         // A stored session is SELECTED but its runtime binding is gone (the
         // live session was orphan-reaped, or a timeout/reconnect cleared
         // activeSessionId). Continuing the selected conversation must mean
@@ -244,7 +245,7 @@ export function useSubmitPrompt(deps: SubmitPromptDeps) {
         // new-chat draft).
         try {
           const resumed = await requestGateway<{ session_id: string }>('session.resume', {
-            session_id: startingStoredSessionId
+            session_id: targetStoredSessionId
           })
 
           if (sessionContextDrifted()) {
@@ -281,16 +282,31 @@ export function useSubmitPrompt(deps: SubmitPromptDeps) {
           return false
         }
 
-        if (sessionContextDrifted()) {
-          return abortForSessionSwitch(sessionId)
-        }
-
+        // Creating a new chat intentionally changes both the selected stored
+        // session and the route. Treat that transition as the submit's new
+        // pinned target, but only while the runtime returned by the creator is
+        // still active. A real user navigation during creation changes the
+        // active ref (or clears it), so it must still abort instead of sending
+        // this prompt into whichever conversation won the race (#54527).
         if (!sessionId) {
           dropOptimistic(null)
           releaseBusy()
           notify({ kind: 'error', title: copy.sessionUnavailable, message: copy.createSessionFailed })
 
           return false
+        }
+
+        if (activeSessionIdRef.current !== sessionId) {
+          return abortForSessionSwitch(sessionId)
+        }
+
+        targetStoredSessionId = selectedStoredSessionIdRef.current
+
+        if (targetStoredSessionId) {
+          // The selected stored id is now the durable pin. React may commit the
+          // matching route replacement before or after this continuation, so
+          // the old new-chat route token is no longer a valid drift signal.
+          routePinned = false
         }
 
         seedOptimistic(sessionId)
@@ -324,7 +340,7 @@ export function useSubmitPrompt(deps: SubmitPromptDeps) {
         } catch (firstErr) {
           if (
             (isSessionNotFoundError(firstErr) || isGatewayTimeoutError(firstErr)) &&
-            startingStoredSessionId
+            targetStoredSessionId
           ) {
             // Re-register the session in the gateway and get a fresh live ID.
             // Timeouts recover the same way as "session not found": a starved
@@ -332,7 +348,7 @@ export function useSubmitPrompt(deps: SubmitPromptDeps) {
             // the stored session is fine — resume + retry instead of erroring
             // out and losing the session binding.
             const resumed = await requestGateway<{ session_id: string }>('session.resume', {
-              session_id: startingStoredSessionId,
+              session_id: targetStoredSessionId,
               source: 'desktop'
             })
 

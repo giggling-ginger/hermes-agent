@@ -79,7 +79,7 @@ function Harness({
   selectedStoredSessionIdRef?: MutableRefObject<string | null>
   storedSessionId?: null | string
   activeSessionId?: null | string
-  createBackendSessionForSend?: () => Promise<null | string>
+  createBackendSessionForSend?: (preview?: string | null) => Promise<null | string>
 }) {
   const activeSessionIdRef: MutableRefObject<string | null> = activeSessionIdRefProp ?? {
     current: activeSessionId === undefined ? RUNTIME_SESSION_ID : activeSessionId
@@ -1293,12 +1293,29 @@ describe('usePromptActions sleep/wake session recovery', () => {
     expect(calls[1]?.params).toMatchObject({ session_id: RECOVERED_SESSION_ID })
   })
 
-  it('still creates a new session for a genuine new-chat draft (no stored session selected)', async () => {
-    const createBackendSessionForSend = vi.fn(async () => RUNTIME_SESSION_ID)
-    const calls: string[] = []
+  it('creates a new session and submits its first message through the intentional route transition (#62501)', async () => {
+    const STORED_SESSION_ID = 'stored-new-chat'
+    const activeSessionIdRef: MutableRefObject<string | null> = { current: null }
+    const selectedStoredSessionIdRef: MutableRefObject<string | null> = { current: null }
+    let routeToken = 'new-chat'
 
-    const requestGateway = vi.fn(async (method: string) => {
-      calls.push(method)
+    // Mirror the real session creator: session.create selects the persisted
+    // row and replaces /chat/new with its routed URL before returning. The
+    // submit pipeline must adopt that intentional transition, not mistake it
+    // for a user switching conversations and stop before prompt.submit.
+    const createBackendSessionForSend = vi.fn(async (preview?: string | null) => {
+      expect(preview).toBe('first message of a new chat')
+      activeSessionIdRef.current = RUNTIME_SESSION_ID
+      selectedStoredSessionIdRef.current = STORED_SESSION_ID
+      routeToken = `session:${STORED_SESSION_ID}`
+
+      return RUNTIME_SESSION_ID
+    })
+
+    const calls: { method: string; params?: Record<string, unknown> }[] = []
+
+    const requestGateway = vi.fn(async (method: string, params?: Record<string, unknown>) => {
+      calls.push({ method, params })
 
       return {} as never
     })
@@ -1307,10 +1324,13 @@ describe('usePromptActions sleep/wake session recovery', () => {
     render(
       <Harness
         activeSessionId={null}
+        activeSessionIdRef={activeSessionIdRef}
         createBackendSessionForSend={createBackendSessionForSend}
+        getRouteToken={() => routeToken}
         onReady={h => (handle = h)}
         refreshSessions={async () => undefined}
         requestGateway={requestGateway}
+        selectedStoredSessionIdRef={selectedStoredSessionIdRef}
         storedSessionId={null}
       />
     )
@@ -1319,7 +1339,12 @@ describe('usePromptActions sleep/wake session recovery', () => {
 
     expect(ok).toBe(true)
     expect(createBackendSessionForSend).toHaveBeenCalledTimes(1)
-    expect(calls).not.toContain('session.resume')
+    expect(calls).toEqual([
+      {
+        method: 'prompt.submit',
+        params: { session_id: RUNTIME_SESSION_ID, text: 'first message of a new chat' }
+      }
+    ])
   })
 })
 
@@ -1390,6 +1415,7 @@ describe('usePromptActions submit session-context isolation (#54527)', () => {
   it('aborts recovery submit when the user switches sessions during timeout resume', async () => {
     const calls: { method: string; params?: Record<string, unknown> }[] = []
     let submitAttempts = 0
+
     let releaseResume: () => void = () => {}
 
     const selectedStoredSessionIdRef: MutableRefObject<string | null> = { current: STORED_SESSION_A }
