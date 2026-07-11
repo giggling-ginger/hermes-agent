@@ -1170,6 +1170,35 @@ def test_boards_total_excludes_archived(client):
     assert shown["include_archived"] is True
 
 
+def test_board_archived_count_respects_tenant_filter(client):
+    """The hidden-archive CTA count must match the selected tenant."""
+    tenant_a = client.post(
+        "/api/plugins/kanban/tasks",
+        json={"title": "archived for a", "tenant": "tenant-a"},
+    ).json()["task"]
+    tenant_b = client.post(
+        "/api/plugins/kanban/tasks",
+        json={"title": "archived for b", "tenant": "tenant-b"},
+    ).json()["task"]
+    response = client.post(
+        "/api/plugins/kanban/tasks/bulk",
+        json={"ids": [tenant_a["id"], tenant_b["id"]], "archive": True},
+    )
+    assert response.status_code == 200
+
+    board_a = client.get(
+        "/api/plugins/kanban/board", params={"tenant": "tenant-a"},
+    ).json()
+    assert board_a["archived_count"] == 1
+    assert all(not column["tasks"] for column in board_a["columns"])
+
+    board_missing = client.get(
+        "/api/plugins/kanban/board", params={"tenant": "tenant-missing"},
+    ).json()
+    assert board_missing["archived_count"] == 0
+    assert all(not column["tasks"] for column in board_missing["columns"])
+
+
 def test_bulk_reassign(client):
     a = client.post("/api/plugins/kanban/tasks",
                     json={"title": "a", "assignee": "old"}).json()["task"]
@@ -2333,3 +2362,7 @@ def test_dashboard_archived_hidden_banner_and_pref_exists():
     assert "hermes.kanban.includeArchived" in js
     assert "function formatBoardTaskSummary" in js
     assert "archived_count" in js
+    # Search and assignee are client-side filters. A board-wide archived
+    # count cannot promise that enabling archives will reveal a matching card.
+    assert "clientFiltersActive: Boolean(assigneeFilter || search.trim())" in js
+    assert "if (props.clientFiltersActive) return null;" in js

@@ -497,13 +497,16 @@ def get_board(
             )
         ]
 
-        # Always surface the archived count so the UI can explain an empty
-        # board ("N archived tasks are hidden") even when include_archived
-        # is false and the card list therefore excludes them. See #61897.
+        # Surface the archived count for the same tenant slice as ``tasks`` so
+        # the UI never attributes a tenant-filtered empty board to archives
+        # that cannot appear when the user enables "Show archived" (#61897).
+        archived_sql = "SELECT COUNT(*) AS n FROM tasks WHERE status = 'archived'"
+        archived_params: list[str] = []
+        if tenant is not None:
+            archived_sql += " AND tenant = ?"
+            archived_params.append(tenant)
         archived_count = int(
-            conn.execute(
-                "SELECT COUNT(*) AS n FROM tasks WHERE status = 'archived'"
-            ).fetchone()["n"]
+            conn.execute(archived_sql, archived_params).fetchone()["n"]
         )
 
         return {

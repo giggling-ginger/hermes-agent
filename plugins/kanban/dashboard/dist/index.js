@@ -1101,6 +1101,7 @@
         h(ArchivedHiddenBanner, {
           archivedCount: (boardData && boardData.archived_count) || 0,
           includeArchived: includeArchived,
+          clientFiltersActive: Boolean(assigneeFilter || search.trim()),
           boardEmpty: !(filteredBoard && filteredBoard.columns
             && filteredBoard.columns.some(function (c) { return c.tasks && c.tasks.length > 0; })),
           onShow: function () { setIncludeArchived(true); },
@@ -2092,6 +2093,10 @@
     // "badge says 48, board is empty" data-loss illusion (#61897).
     const { t } = useI18n();
     if (props.includeArchived) return null;
+    // The API scopes archived_count to the selected tenant. Assignee and
+    // search remain client-side filters, so a board-wide archived count
+    // cannot explain an empty view while either one is active.
+    if (props.clientFiltersActive) return null;
     if (!props.boardEmpty) return null;
     const n = props.archivedCount || 0;
     if (n <= 0) return null;
