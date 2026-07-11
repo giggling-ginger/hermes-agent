@@ -15,6 +15,7 @@ import { clearNotifications, notify, notifyError } from '@/store/notifications'
 import { requestDesktopOnboarding } from '@/store/onboarding'
 import { setAwaitingResponse, setBusy, setMessages } from '@/store/session'
 
+import { sessionRoute } from '../../../routes'
 import type { ClientSessionState } from '../../../types'
 
 import {
@@ -120,12 +121,24 @@ export function useSubmitPrompt(deps: SubmitPromptDeps) {
       // redirect the user's text into a different chat (#54527).
       const startingActiveSessionId = activeSessionIdRef.current
       let targetStoredSessionId = selectedStoredSessionIdRef.current
-      const startingRouteToken = getRouteToken()
-      let routePinned = true
+      let expectedRouteToken = getRouteToken()
+      let transitionalRouteToken: null | string = null
 
-      const sessionContextDrifted = (): boolean =>
-        selectedStoredSessionIdRef.current !== targetStoredSessionId ||
-        (routePinned && getRouteToken() !== startingRouteToken)
+      const sessionContextDrifted = (): boolean => {
+        if (selectedStoredSessionIdRef.current !== targetStoredSessionId) {
+          return true
+        }
+
+        const currentRouteToken = getRouteToken()
+
+        if (currentRouteToken === expectedRouteToken) {
+          transitionalRouteToken = null
+
+          return false
+        }
+
+        return currentRouteToken !== transitionalRouteToken
+      }
 
       // One submit in flight per session — drop any concurrent re-fire so a
       // stalled turn can't stack the same prompt into multiple real turns.
@@ -303,10 +316,14 @@ export function useSubmitPrompt(deps: SubmitPromptDeps) {
         targetStoredSessionId = selectedStoredSessionIdRef.current
 
         if (targetStoredSessionId) {
-          // The selected stored id is now the durable pin. React may commit the
-          // matching route replacement before or after this continuation, so
-          // the old new-chat route token is no longer a valid drift signal.
-          routePinned = false
+          // The creator intentionally replaces the new-chat route with the
+          // persisted session route. Rebase the route pin to that destination,
+          // while briefly accepting the previous token in case React has not
+          // committed the replacement yet. Sidebar navigation uses a third
+          // token before resumeSession updates the selected-session ref, so it
+          // still aborts this submit while a later await is in flight.
+          transitionalRouteToken = expectedRouteToken
+          expectedRouteToken = `${sessionRoute(targetStoredSessionId)}::`
         }
 
         seedOptimistic(sessionId)
@@ -338,10 +355,7 @@ export function useSubmitPrompt(deps: SubmitPromptDeps) {
             requestGateway('prompt.submit', { session_id: sessionId, text }, PROMPT_SUBMIT_REQUEST_TIMEOUT_MS)
           )
         } catch (firstErr) {
-          if (
-            (isSessionNotFoundError(firstErr) || isGatewayTimeoutError(firstErr)) &&
-            targetStoredSessionId
-          ) {
+          if ((isSessionNotFoundError(firstErr) || isGatewayTimeoutError(firstErr)) && targetStoredSessionId) {
             // Re-register the session in the gateway and get a fresh live ID.
             // Timeouts recover the same way as "session not found": a starved
             // backend loop (#55578 symptom d) rejects the submit even though
