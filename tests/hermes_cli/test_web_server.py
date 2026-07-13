@@ -6640,6 +6640,29 @@ class TestPtyWebSocket:
         assert env["HERMES_PYTHON"] == sys.executable
         assert env["HERMES_CWD"] == os.getcwd()
 
+    def test_resolve_chat_argv_preserves_valid_tui_python_environment(self, monkeypatch, tmp_path):
+        """Explicit usable TUI paths still take precedence over launcher defaults."""
+        import hermes_cli.main as main_mod
+
+        python = tmp_path / "python"
+        python.write_text("#!/bin/sh\n", encoding="utf-8")
+        python.chmod(0o755)
+        monkeypatch.setenv("HERMES_PYTHON_SRC_ROOT", str(tmp_path))
+        monkeypatch.setenv("HERMES_PYTHON", str(python))
+        monkeypatch.setenv("HERMES_CWD", str(tmp_path))
+        monkeypatch.setattr(
+            main_mod,
+            "_make_tui_argv",
+            lambda project_root, tui_dev=False: (["node", "dist/entry.js"], "/tmp/ui-tui"),
+        )
+
+        _argv, _cwd, env = self.ws_module._resolve_chat_argv()
+
+        assert env is not None
+        assert env["HERMES_PYTHON_SRC_ROOT"] == str(tmp_path)
+        assert env["HERMES_PYTHON"] == str(python)
+        assert env["HERMES_CWD"] == str(tmp_path)
+
     def test_resolve_chat_argv_falls_back_when_getcwd_is_missing(self, monkeypatch, tmp_path):
         """Dashboard chat still starts if the service cwd was deleted."""
         import hermes_cli.main as main_mod
